@@ -20,6 +20,31 @@ class Product(BaseModel):
     image_url: Optional[str] = Field(None, description="Image URL for product")
 
 
+class ProductPriceUpdate(BaseModel):
+    price: float = Field(..., ge=0, description="New price in UGX")
+
+
+class ProductAdminUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    price: Optional[float] = Field(None, ge=0)
+    category: Optional[str] = None
+    brand: Optional[str] = None
+    type: Optional[str] = None
+    unit: Optional[str] = None
+    in_stock: Optional[bool] = None
+    image_url: Optional[str] = None
+
+
+class BulkPriceItem(BaseModel):
+    product_id: str
+    price: float = Field(..., ge=0)
+
+
+class BulkPriceUpdate(BaseModel):
+    items: List[BulkPriceItem]
+
+
 class OrderItem(BaseModel):
     product_id: str = Field(..., description="Product ObjectId as string")
     name: str = Field(..., description="Product name at time of order")
@@ -44,9 +69,13 @@ class Order(BaseModel):
     notes: Optional[str] = None
 
 
+class OrderStatusUpdate(BaseModel):
+    status: str = Field(..., description="pending | paid | failed | cancelled | fulfilled")
+    notes: Optional[str] = None
+
+
 class PaymentInit(BaseModel):
     order_id: str
     method: str = Field(..., description="mobile_money | card")
     amount: float = Field(..., ge=0)
     phone: Optional[str] = Field(None, description="Required for mobile money")
-

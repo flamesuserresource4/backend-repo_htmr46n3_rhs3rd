@@ -6,7 +6,7 @@ from typing import List, Optional
 from bson import ObjectId
 
 from database import db, create_document, get_documents
-from schemas import Product, Order, PaymentInit
+from schemas import Product, Order, PaymentInit, ProductPriceUpdate, ProductAdminUpdate, BulkPriceUpdate, OrderStatusUpdate
 
 app = FastAPI(title="Kakineha Coffee Beverages API")
 
@@ -58,6 +58,11 @@ class ProductOut(Product):
     id: Optional[str] = None
 
 
+class OrderOut(BaseModel):
+    id: str
+    data: dict
+
+
 def serialize_doc(doc):
     if not doc:
         return doc
@@ -89,6 +94,58 @@ async def list_products(brand: Optional[str] = None, category: Optional[str] = N
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ------------------ Admin: Product Management ------------------
+@app.patch("/api/admin/products/{product_id}/price", response_model=dict)
+async def update_product_price(product_id: str, payload: ProductPriceUpdate):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    try:
+        res = db["product"].update_one({"_id": ObjectId(product_id)}, {"$set": {"price": payload.price}})
+        if res.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Product not found")
+        return {"id": product_id, "price": payload.price}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/api/admin/products/{product_id}", response_model=dict)
+async def admin_update_product(product_id: str, payload: ProductAdminUpdate):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    updates = {k: v for k, v in payload.model_dump(exclude_unset=True).items()}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    try:
+        updates["updated_at"] = __import__("datetime").datetime.utcnow()
+        res = db["product"].update_one({"_id": ObjectId(product_id)}, {"$set": updates})
+        if res.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Product not found")
+        doc = db["product"].find_one({"_id": ObjectId(product_id)})
+        return serialize_doc(doc)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/products/bulk-price", response_model=dict)
+async def bulk_update_prices(payload: BulkPriceUpdate):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    try:
+        updated = 0
+        for item in payload.items:
+            res = db["product"].update_one({"_id": ObjectId(item.product_id)}, {"$set": {"price": item.price}})
+            if res.matched_count:
+                updated += 1
+        return {"updated": updated, "total": len(payload.items)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ------------------ Orders ------------------
 @app.post("/api/orders", response_model=dict)
 async def create_order(order: Order):
     try:
@@ -104,6 +161,56 @@ async def create_order(order: Order):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/admin/orders", response_model=List[dict])
+async def admin_list_orders(status: Optional[str] = None, limit: int = 100):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    try:
+        query = {}
+        if status:
+            query["status"] = status
+        docs = get_documents("order", query, limit=limit)
+        return [serialize_doc(d) for d in docs]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/admin/orders/{order_id}", response_model=dict)
+async def admin_get_order(order_id: str):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    try:
+        doc = db["order"].find_one({"_id": ObjectId(order_id)})
+        if not doc:
+            raise HTTPException(status_code=404, detail="Order not found")
+        return serialize_doc(doc)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/api/admin/orders/{order_id}", response_model=dict)
+async def admin_update_order(order_id: str, payload: OrderStatusUpdate):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    try:
+        updates = {"status": payload.status}
+        if payload.notes is not None:
+            updates["notes"] = payload.notes
+        updates["updated_at"] = __import__("datetime").datetime.utcnow()
+        res = db["order"].update_one({"_id": ObjectId(order_id)}, {"$set": updates})
+        if res.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Order not found")
+        doc = db["order"].find_one({"_id": ObjectId(order_id)})
+        return serialize_doc(doc)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ------------------ Payments ------------------
 @app.post("/api/payments/init", response_model=dict)
 async def init_payment(payload: PaymentInit):
     # NOTE: In production, integrate with a real provider (MTN/Airtel Mobile Money, Stripe, etc.)
