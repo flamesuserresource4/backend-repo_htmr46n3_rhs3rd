@@ -1,13 +1,37 @@
 import os
-from fastapi import FastAPI, HTTPException
+from datetime import datetime, timedelta
+from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from typing import List, Optional
 from bson import ObjectId
+import jwt
+from jwt import InvalidTokenError
+from passlib.context import CryptContext
 
 from database import db, create_document, get_documents
-from schemas import Product, Order, PaymentInit, ProductPriceUpdate, ProductAdminUpdate, BulkPriceUpdate, OrderStatusUpdate
+from schemas import (
+    Product, Order, PaymentInit, ProductPriceUpdate, ProductAdminUpdate,
+    BulkPriceUpdate, OrderStatusUpdate, UserCreate, UserOut
+)
 
+# ------------------ Auth Config ------------------
+SECRET_KEY = os.getenv("SECRET_KEY", "supersecretkey-change-me")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
+
+# Use a scheme that doesn't require external C extensions
+pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+# ------------------ App Init ------------------
 app = FastAPI(title="Kakineha Coffee Beverages API")
 
 app.add_middleware(
@@ -53,7 +77,54 @@ def test_database():
     return response
 
 
-# Utility to convert ObjectId to string in API responses
+# ------------------ Auth Helpers ------------------
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        role: str = payload.get("role")
+        if user_id is None:
+            raise credentials_exception
+    except InvalidTokenError:
+        raise credentials_exception
+    # fetch user
+    user = db["user"].find_one({"_id": ObjectId(user_id)}) if db else None
+    if not user:
+        raise credentials_exception
+    user["id"] = str(user["_id"])
+    user.pop("_id", None)
+    return user
+
+
+async def require_admin(user=Depends(get_current_user)):
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
+
+
+# ------------------ Utility ------------------
 class ProductOut(Product):
     id: Optional[str] = None
 
@@ -71,6 +142,57 @@ def serialize_doc(doc):
     return doc
 
 
+# ------------------ Auth Routes ------------------
+@app.post("/api/auth/register", response_model=UserOut)
+async def register(user: UserCreate):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    # unique email
+    if db["user"].find_one({"email": user.email}):
+        raise HTTPException(status_code=400, detail="Email already registered")
+    doc = user.model_dump()
+    doc["password"] = get_password_hash(doc.pop("password"))
+    inserted_id = db["user"].insert_one({
+        **doc,
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+    }).inserted_id
+    created = db["user"].find_one({"_id": inserted_id})
+    return serialize_doc(created)
+
+
+@app.post("/api/auth/login", response_model=Token)
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    user = db["user"].find_one({"email": form_data.username})
+    if not user or not verify_password(form_data.password, user.get("password", "")):
+        raise HTTPException(status_code=400, detail="Incorrect email or password")
+    access_token = create_access_token({"sub": str(user["_id"]), "role": user.get("role", "user")})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+@app.post("/api/auth/seed-admin", response_model=dict)
+async def seed_admin():
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    email = os.getenv("SEED_ADMIN_EMAIL", "admin@example.com")
+    password = os.getenv("SEED_ADMIN_PASSWORD", "Admin@123")
+    if db["user"].find_one({"email": email}):
+        return {"status": "exists", "email": email}
+    doc = {
+        "email": email,
+        "password": get_password_hash(password),
+        "role": "admin",
+        "full_name": "Admin",
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+    }
+    db["user"].insert_one(doc)
+    return {"status": "created", "email": email, "password": password}
+
+
+# ------------------ Public Product Routes ------------------
 @app.post("/api/products", response_model=dict)
 async def create_product(product: Product):
     try:
@@ -95,12 +217,12 @@ async def list_products(brand: Optional[str] = None, category: Optional[str] = N
 
 
 # ------------------ Admin: Product Management ------------------
-@app.patch("/api/admin/products/{product_id}/price", response_model=dict)
+@app.patch("/api/admin/products/{product_id}/price", response_model=dict, dependencies=[Depends(require_admin)])
 async def update_product_price(product_id: str, payload: ProductPriceUpdate):
     if db is None:
         raise HTTPException(status_code=500, detail="Database not available")
     try:
-        res = db["product"].update_one({"_id": ObjectId(product_id)}, {"$set": {"price": payload.price}})
+        res = db["product"].update_one({"_id": ObjectId(product_id)}, {"$set": {"price": payload.price, "updated_at": datetime.utcnow()}})
         if res.matched_count == 0:
             raise HTTPException(status_code=404, detail="Product not found")
         return {"id": product_id, "price": payload.price}
@@ -110,7 +232,7 @@ async def update_product_price(product_id: str, payload: ProductPriceUpdate):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.patch("/api/admin/products/{product_id}", response_model=dict)
+@app.patch("/api/admin/products/{product_id}", response_model=dict, dependencies=[Depends(require_admin)])
 async def admin_update_product(product_id: str, payload: ProductAdminUpdate):
     if db is None:
         raise HTTPException(status_code=500, detail="Database not available")
@@ -118,7 +240,7 @@ async def admin_update_product(product_id: str, payload: ProductAdminUpdate):
     if not updates:
         raise HTTPException(status_code=400, detail="No fields to update")
     try:
-        updates["updated_at"] = __import__("datetime").datetime.utcnow()
+        updates["updated_at"] = datetime.utcnow()
         res = db["product"].update_one({"_id": ObjectId(product_id)}, {"$set": updates})
         if res.matched_count == 0:
             raise HTTPException(status_code=404, detail="Product not found")
@@ -130,14 +252,14 @@ async def admin_update_product(product_id: str, payload: ProductAdminUpdate):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/admin/products/bulk-price", response_model=dict)
+@app.post("/api/admin/products/bulk-price", response_model=dict, dependencies=[Depends(require_admin)])
 async def bulk_update_prices(payload: BulkPriceUpdate):
     if db is None:
         raise HTTPException(status_code=500, detail="Database not available")
     try:
         updated = 0
         for item in payload.items:
-            res = db["product"].update_one({"_id": ObjectId(item.product_id)}, {"$set": {"price": item.price}})
+            res = db["product"].update_one({"_id": ObjectId(item.product_id)}, {"$set": {"price": item.price, "updated_at": datetime.utcnow()}})
             if res.matched_count:
                 updated += 1
         return {"updated": updated, "total": len(payload.items)}
@@ -161,7 +283,7 @@ async def create_order(order: Order):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/admin/orders", response_model=List[dict])
+@app.get("/api/admin/orders", response_model=List[dict], dependencies=[Depends(require_admin)])
 async def admin_list_orders(status: Optional[str] = None, limit: int = 100):
     if db is None:
         raise HTTPException(status_code=500, detail="Database not available")
@@ -175,7 +297,7 @@ async def admin_list_orders(status: Optional[str] = None, limit: int = 100):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/admin/orders/{order_id}", response_model=dict)
+@app.get("/api/admin/orders/{order_id}", response_model=dict, dependencies=[Depends(require_admin)])
 async def admin_get_order(order_id: str):
     if db is None:
         raise HTTPException(status_code=500, detail="Database not available")
@@ -190,7 +312,7 @@ async def admin_get_order(order_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.patch("/api/admin/orders/{order_id}", response_model=dict)
+@app.patch("/api/admin/orders/{order_id}", response_model=dict, dependencies=[Depends(require_admin)])
 async def admin_update_order(order_id: str, payload: OrderStatusUpdate):
     if db is None:
         raise HTTPException(status_code=500, detail="Database not available")
@@ -198,7 +320,7 @@ async def admin_update_order(order_id: str, payload: OrderStatusUpdate):
         updates = {"status": payload.status}
         if payload.notes is not None:
             updates["notes"] = payload.notes
-        updates["updated_at"] = __import__("datetime").datetime.utcnow()
+        updates["updated_at"] = datetime.utcnow()
         res = db["order"].update_one({"_id": ObjectId(order_id)}, {"$set": updates})
         if res.matched_count == 0:
             raise HTTPException(status_code=404, detail="Order not found")
@@ -213,13 +335,10 @@ async def admin_update_order(order_id: str, payload: OrderStatusUpdate):
 # ------------------ Payments ------------------
 @app.post("/api/payments/init", response_model=dict)
 async def init_payment(payload: PaymentInit):
-    # NOTE: In production, integrate with a real provider (MTN/Airtel Mobile Money, Stripe, etc.)
-    # Here we simulate a payment intent and return a mock reference for demo.
     if payload.method == "mobile_money" and not payload.phone:
         raise HTTPException(status_code=400, detail="Phone is required for mobile money")
 
     reference = f"PMT-{ObjectId()}"
-    # Persist a payment record
     data = {
         "order_id": payload.order_id,
         "method": payload.method,
@@ -237,7 +356,6 @@ async def init_payment(payload: PaymentInit):
 
 @app.get("/api/payments/status/{reference}", response_model=dict)
 async def payment_status(reference: str):
-    # Mock status for demo purposes
     return {"reference": reference, "status": "pending"}
 
 

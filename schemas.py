@@ -5,7 +5,7 @@ Each Pydantic model represents a collection in MongoDB.
 Collection name is the lowercase class name.
 """
 from typing import Optional, List
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 
 
 class Product(BaseModel):
@@ -56,7 +56,7 @@ class OrderItem(BaseModel):
 class Customer(BaseModel):
     full_name: str
     phone: str
-    email: Optional[str] = None
+    email: Optional[EmailStr] = None
     address: Optional[str] = None
 
 
@@ -79,3 +79,25 @@ class PaymentInit(BaseModel):
     method: str = Field(..., description="mobile_money | card")
     amount: float = Field(..., ge=0)
     phone: Optional[str] = Field(None, description="Required for mobile money")
+
+
+# -------- Auth/User Schemas --------
+class UserBase(BaseModel):
+    email: EmailStr
+
+
+class UserCreate(UserBase):
+    password: str
+    full_name: Optional[str] = None
+    role: str = Field("user", description="user | admin")
+
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class UserOut(UserBase):
+    id: str
+    full_name: Optional[str] = None
+    role: str = "user"
